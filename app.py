@@ -1,11 +1,22 @@
 import streamlit as st
 from openai import OpenAI
-import pdfplumber# 新增：用于读取 PDF 的库
+import pdfplumber
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件里的密码
+load_dotenv()
+
+# 从环境变量中安全地获取 API Key
+# 这样哪怕代码开源，别人也看不到你的 Key
+api_key = os.getenv("DEEPSEEK_API_KEY")
 
 client = OpenAI(
-    api_key="sk-5e743e254c6f4a29adcf58722ff6d0ac", 
+    api_key=api_key, 
     base_url="https://api.deepseek.com"
 )
+
+# ... 下面原本的代码完全保持不变 ...
 
 st.set_page_config(page_title="企业知识库 AI", page_icon="📄")
 st.title("📄 企业级私有知识库助手")
