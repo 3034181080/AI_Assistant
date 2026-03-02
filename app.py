@@ -2,20 +2,25 @@ import streamlit as st
 from openai import OpenAI
 import pdfplumber
 import os
-from dotenv import load_dotenv
 
-# 加载 .env 文件里的密码
-load_dotenv()
+# 智能获取 API Key：先尝试从 Streamlit Secrets 获取（云端环境），如果没有再尝试从本地环境变量获取
+try:
+    api_key = st.secrets["DEEPSEEK_API_KEY"]
+except (KeyError, FileNotFoundError):
+    # 如果上面失败了，说明是在本地运行，那就用 dotenv 从本地 .env 文件读
+    from dotenv import load_dotenv
+    load_dotenv()
+    api_key = os.getenv("DEEPSEEK_API_KEY")
 
-# 从环境变量中安全地获取 API Key
-# 这样哪怕代码开源，别人也看不到你的 Key
-api_key = os.getenv("DEEPSEEK_API_KEY")
+# 如果还是空，就在网页上弹个红色警告，方便排错
+if not api_key:
+    st.error("🚨 致命错误：找不到 API Key！请检查 Secrets 或 .env 配置！")
+    st.stop() # 停止运行
 
 client = OpenAI(
     api_key=api_key, 
     base_url="https://api.deepseek.com"
 )
-
 # ... 下面原本的代码完全保持不变 ...
 
 st.set_page_config(page_title="企业知识库 AI", page_icon="📄")
