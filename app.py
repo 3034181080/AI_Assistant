@@ -2,89 +2,129 @@ import streamlit as st
 from openai import OpenAI
 import pdfplumber
 import os
+import tempfile
+import uuid
 
-# 智能获取 API Key：先尝试从 Streamlit Secrets 获取（云端环境），如果没有再尝试从本地环境变量获取
+# 引入 RAG 相关库
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import DashScopeEmbeddings
+
+# 智能获取 API Key
 try:
-    api_key = st.secrets["DEEPSEEK_API_KEY"]
+    deepseek_key = st.secrets["DEEPSEEK_API_KEY"]
+    dashscope_key = st.secrets["DASHSCOPE_API_KEY"]
 except (KeyError, FileNotFoundError):
-    # 如果上面失败了，说明是在本地运行，那就用 dotenv 从本地 .env 文件读
     from dotenv import load_dotenv
     load_dotenv()
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    dashscope_key = os.getenv("DASHSCOPE_API_KEY")
 
-# 如果还是空，就在网页上弹个红色警告，方便排错
-if not api_key:
-    st.error("🚨 致命错误：找不到 API Key！请检查 Secrets 或 .env 配置！")
-    st.stop() # 停止运行
+if not deepseek_key or not dashscope_key:
+    st.error("致命错误：找不到 API Key！请检查 Secrets 或 .env 配置！")
+    st.stop()
+
+# 设置环境变量，�� LangChain 底层调用
+os.environ["DASHSCOPE_API_KEY"] = dashscope_key
 
 client = OpenAI(
-    api_key=api_key, 
+    api_key=deepseek_key, 
     base_url="https://api.deepseek.com"
 )
-# ... 下面原本的代码完全保持不变 ...
 
-st.set_page_config(page_title="企业知识库 AI", page_icon="📄")
-st.title("📄 企业级私有知识库助手")
+st.set_page_config(page_title="企业知识库 AI (RAG 版)", page_icon="📄")
+st.title("智能私有知识库 (支持超大文档)")
 
-# ================= 核心商业逻辑：侧边栏上传文档 =================
-with st.sidebar:
-    st.header("1. 喂给 AI 私有数据")
-    uploaded_file = st.file_uploader("请上传一份 PDF 或 TXT 文档", type=["pdf", "txt"])
-    
-    doc_text = ""
-    if uploaded_file is not None:
-        # 判断文件类型并提取文字
-        if uploaded_file.name.endswith(".pdf"):
-    # 使用更强大的 pdfplumber 解析中文和表格
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-            # 提取文本，并尽量保留表格的排版格式
-                    text = page.extract_text(layout=True) 
-            if text:
-                doc_text += text + "\n"
-            
-        st.success(f"✅ 文件解析成功！共提取了 {len(doc_text)} 个字符。")
-        # 增加一个开关，让用户决定要不要看提取出来的纯文本
-        with st.expander("查看提取的文本片段"):
-            st.write(doc_text[:500] + "...")
-
-# ================= 聊天界面逻辑 =================
+# 初始化 Session State
+if "vector_db" not in st.session_state:
+    st.session_state.vector_db = None
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "老板好，请在左侧上传文档，然后向我提问！"}]
+    st.session_state.messages = [{"role": "assistant", "content": "老板好，我是你的私有数据助手。请在左侧上传文档，等待数据库建立完成后再向我提问！"}]
 
+# ================= 侧边栏：文档处理与建库 =================
+with st.sidebar:
+    st.header("1. 上传私有数据")
+    uploaded_file = st.file_uploader("支持 PDF/TXT (可处理长文档)", type=["pdf", "txt"])
+    
+    if uploaded_file is not None and st.session_state.vector_db is None:
+        with st.spinner("正在解析文档并建立专属知识库，请稍候..."):
+            doc_text = ""
+            if uploaded_file.name.endswith(".pdf"):
+                with pdfplumber.open(uploaded_file) as pdf:
+                    for page in pdf.pages:
+                        text = page.extract_text(layout=True) 
+                        if text:
+                            doc_text += text + "\n"
+            else:
+                doc_text = uploaded_file.getvalue().decode("utf-8")
+            
+            # 1. 文本切分
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,  # 网页版切块可以大一点
+                chunk_overlap=50
+            )
+            chunks = text_splitter.split_text(doc_text)
+            
+            # 2. 建立向量数据库 (存入临时文件夹，保证每次会话独立)
+            temp_dir = tempfile.mkdtemp()
+            db_path = os.path.join(temp_dir, f"chroma_{uuid.uuid4().hex[:8]}")
+            
+            embedding_model = DashScopeEmbeddings(model="text-embedding-v2")
+            st.session_state.vector_db = Chroma.from_texts(
+                texts=chunks, 
+                embedding=embedding_model, 
+                persist_directory=db_path
+            )
+            
+            st.success(f"知识库建立完成！共分为 {len(chunks)} 个数据块。")
+
+# ================= 聊天界面 =================
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("请输入基于文档的问题..."):
-    # 1. 记录用户输入并在网页显示
+if prompt := st.chat_input("请输入您的问题..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 2. 构造传给 AI 的完整消息（重点！！）
-    # 如果上传了文档，我们就动态构造一个 "系统提示词(System Prompt)"，强迫大模型基于文档回答
-    api_messages = []
-    if doc_text:
-        system_prompt = f"""
-        你是一个专业的企业数据分析师。请你严格基于以下【参考文档】的内容来回答用户的问题。
-        如果用户的提问在文档中找不到答案，请直接回答“抱歉，文档中未提及相关信息”，绝对不要自己瞎编。
-        
-        【参考文档】：
-        {doc_text[:8000]} # 限制一下长度，防止一次性传入过多字符导致 API 报错
-        """
-        api_messages.append({"role": "system", "content": system_prompt})
-    
-    # 把历史对话拼接在系统提示词后面
-    api_messages.extend(st.session_state.messages)
-
-    # 3. 调用 API 生成回复
     with st.chat_message("assistant"):
-        stream = client.chat.completions.create(
-            model="deepseek-chat",  
-            messages=api_messages,  # 注意这里传的是我们拼接好的 api_messages
-            stream=True 
-        )
-        response = st.write_stream(stream)
+        message_placeholder = st.empty()
+        full_response = ""
         
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        # 核心逻辑：如果建好了数据库，就去检索
+        context_text = ""
+        if st.session_state.vector_db is not None:
+            # 检索最相关的 3 个文档块
+            retrieved_docs = st.session_state.vector_db.similarity_search(prompt, k=3)
+            for i, doc in enumerate(retrieved_docs):
+                context_text += f"[片段 {i+1}]: {doc.page_content}\n"
+            
+            # 如果想在网页上看看它捞出了什么，可以取消下面这行的注释
+            # st.info(f"后台检索到的相关片段：\n{context_text}")
+
+        # 构造发给大模型的提示词
+        if context_text:
+            system_prompt = f"你是一个专业的数据分析师。请严格根据以下背景资料回答问题。\n背景资料：\n{context_text}"
+        else:
+            system_prompt = "你是一个智能助手，请正常回答用户的问题。"
+
+        # 调用大模型流式输出
+        try:
+            stream = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=True
+            )
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    full_response += chunk.choices[0].delta.content
+                    message_placeholder.markdown(full_response + "▌")
+            message_placeholder.markdown(full_response)
+        except Exception as e:
+            message_placeholder.markdown(f"服务器开小差了，请稍后再试。错误信息：{str(e)}")
+
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
