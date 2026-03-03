@@ -79,52 +79,65 @@ with st.sidebar:
             st.success(f"知识库建立完成！共分为 {len(chunks)} 个数据块。")
 
 # ================= 聊天界面 =================
+# ================= 6. 主聊天界面模块 =================
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
 if prompt := st.chat_input("请输入您的问题..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # 异常拦截：未建库不允许提问
+    if st.session_state.vector_db is None:
+        st.warning("请求被拦截：请先在左侧上传文档并等待知识库建立完成。")
+    else:
+        # 将用户的新问题存入网页显示列表
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-        
-        # 核心逻辑：如果建好了数据库，就去检索
-        context_text = ""
-        if st.session_state.vector_db is not None:
-            # 检索最相关的 3 个文档块
-            retrieved_docs = st.session_state.vector_db.similarity_search(prompt, k=3)
-            for i, doc in enumerate(retrieved_docs):
-                context_text += f"[片段 {i+1}]: {doc.page_content}\n"
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
             
-            # 如果想在网页上看看它捞出了什么，可以取消下面这行的注释
-            # st.info(f"后台检索到的相关片段：\n{context_text}")
+            # RAG 步骤三：语义检索（获取最新的相关文档片段）
+            context_text = ""
+            try:
+                retrieved_docs = st.session_state.vector_db.similarity_search(prompt, k=3)
+                for i, doc in enumerate(retrieved_docs):
+                    context_text += f"[参考片段 {i+1}]: {doc.page_content}\n"
+            except Exception as e:
+                st.error(f"检索数据库时发生错误：{str(e)}")
+                st.stop()
 
-        # 构造发给大模型的提示词
-        if context_text:
-            system_prompt = f"你是一个专业的数据分析师。请严格根据以下背景资料回答问题。\n背景资料：\n{context_text}"
-        else:
-            system_prompt = "你是一个智能助手，请正常回答用户的问题。"
+            # 构造系统提示词（System Prompt）
+            system_prompt = f"你是一个专业的数据分析师。请严格基于以下背景资料回答问题，如果没有相关信息，请回答“未找到相关数据”。\n背景资料：\n{context_text}"
 
-        # 调用大模型流式输出
-        try:
-            stream = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                stream=True
-            )
-            for chunk in stream:
-                if chunk.choices[0].delta.content is not None:
-                    full_response += chunk.choices[0].delta.content
-                    message_placeholder.markdown(full_response + "▌")
-            message_placeholder.markdown(full_response)
-        except Exception as e:
-            message_placeholder.markdown(f"服务器开小差了，请稍后再试。错误信息：{str(e)}")
+            # 核心升级：构造带有“短期记忆”的对话上下文
+            # 1. 放入系统提示词（强制规则和当前检索到的背景知识）
+            api_messages = [{"role": "system", "content": system_prompt}]
+            
+            # 2. 截取最近的 4 条历史对话（即最近的 2 轮问答），防止 Token 消耗过大
+            # 注意：我们要跳过第一条“欢迎语”，因为它没有上下文价值
+            history = st.session_state.messages[1:-1][-4:] 
+            for msg in history:
+                api_messages.append({"role": msg["role"], "content": msg["content"]})
+                
+            # 3. 放入当前最新的问题
+            api_messages.append({"role": "user", "content": prompt})
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+            # 调用大模型流式输出
+            try:
+                stream = client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=api_messages,
+                    stream=True
+                )
+                for chunk in stream:
+                    if chunk.choices[0].delta.content is not None:
+                        full_response += chunk.choices[0].delta.content
+                        message_placeholder.markdown(full_response + "▌")
+                message_placeholder.markdown(full_response)
+            except Exception as e:
+                message_placeholder.markdown(f"服务异常，请稍后重试。详细信息：{str(e)}")
+
+        # 将 AI 的回答存入历史记录，供下一轮对话读取
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
